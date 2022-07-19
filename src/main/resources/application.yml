@@ -1,0 +1,22 @@
+spring:
+  batch:
+    job:
+      names: ${job.name:NONE}
+    jdbc:
+      initialize-schema: always
+  datasource:
+#    driver-class-name: com.mysql.cj.jdbc.Driver
+#    url: jdbc:mysql://scnohdb.cscks1c1hr2u.us-west-1.rds.amazonaws.com/spring_batch?characterEncoding=UTF-8&serverTimezone=UTC&rewriteBatchedStatements=true
+#    username: scnoh
+#    password: scnoh0760!
+    hikari:
+      driver-class-name: org.h2.Driver
+      username: sa
+      password: 1234
+  h2:
+    console:
+      enabled: true
+  jpa:
+    show-sql: true
+    hibernate:
+      ddl-auto: update

@@ -1,8 +1,11 @@
-package com.handler.batch.config.practice2;
+package com.handler.batch.config.practice4;
 
+import com.handler.batch.config.practice2.LevelUpJobExecutionListener;
+import com.handler.batch.config.practice2.SaveUserTasklet;
+import com.handler.batch.config.practice2.User;
+import com.handler.batch.config.practice2.UserRepository;
 import com.handler.batch.config.practice3.JobParametersDecide;
 import com.handler.batch.config.practice3.OrderStatistics;
-import com.handler.batch.config.practice3.Orders;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.batch.core.Job;
@@ -10,7 +13,14 @@ import org.springframework.batch.core.Step;
 import org.springframework.batch.core.configuration.annotation.JobBuilderFactory;
 import org.springframework.batch.core.configuration.annotation.JobScope;
 import org.springframework.batch.core.configuration.annotation.StepBuilderFactory;
+import org.springframework.batch.core.configuration.annotation.StepScope;
+import org.springframework.batch.core.job.builder.FlowBuilder;
+import org.springframework.batch.core.job.flow.Flow;
+import org.springframework.batch.core.job.flow.support.SimpleFlow;
 import org.springframework.batch.core.launch.support.RunIdIncrementer;
+import org.springframework.batch.core.partition.PartitionHandler;
+import org.springframework.batch.core.partition.support.TaskExecutorPartitionHandler;
+import org.springframework.batch.core.step.tasklet.TaskletStep;
 import org.springframework.batch.item.ItemProcessor;
 import org.springframework.batch.item.ItemReader;
 import org.springframework.batch.item.ItemWriter;
@@ -27,6 +37,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.io.FileSystemResource;
+import org.springframework.core.task.TaskExecutor;
 
 import javax.persistence.EntityManagerFactory;
 import javax.sql.DataSource;
@@ -39,9 +50,9 @@ import java.util.Map;
 @Configuration
 @Slf4j
 @RequiredArgsConstructor
-public class UserConfiguration {
+public class ParallelUserConfiguration {
 
-    private final String JOB_NAME = "userJob";
+    private final String JOB_NAME = "parallelUserJob";
     private final int CHUNK = 1000;
 
     private final JobBuilderFactory jobBuilderFactory;
@@ -49,18 +60,28 @@ public class UserConfiguration {
     private final UserRepository userRepository;
     private final EntityManagerFactory entityManagerFactory;
     private final DataSource dataSource;
+    private final TaskExecutor taskExecutor;
+
 
     @Bean(JOB_NAME)
     public Job userJob() throws Exception {
         return this.jobBuilderFactory.get(JOB_NAME)
                 .incrementer(new RunIdIncrementer())
-                .start(this.saveUserStep())
-                .next(this.userLevelUpStep())
                 .listener(new LevelUpJobExecutionListener(userRepository))
-                .next(new JobParametersDecide("date"))
-                .on(JobParametersDecide.CONTINUE.getName())
-                .to(this.orderStatisticsStep(null, null))
+                .start(this.saveUserFlow())
+                .next(this.splitFlow(null))
                 .build()
+                .build();
+    }
+
+    @Bean(JOB_NAME+"_saveUserFLow")
+    public Flow saveUserFlow() {
+        TaskletStep saveUserStep = this.stepBuilderFactory.get(JOB_NAME + "_saveUserStep")
+                .tasklet(new SaveUserTasklet(userRepository))
+                .build();
+
+        return new FlowBuilder<SimpleFlow>(JOB_NAME+"_saveUserFLow")
+                .start(saveUserStep)
                 .build();
     }
 
@@ -75,24 +96,64 @@ public class UserConfiguration {
     public Step userLevelUpStep() throws Exception {
         return stepBuilderFactory.get(JOB_NAME+"+userLevelUpStep")
                 .<User, User>chunk(CHUNK)
-                .reader(itemReader())
+                .reader(itemReader(null, null))
                 .processor(itemProcessor())
                 .writer(itemWriter())
                 .build();
     }
 
-    @Bean(JOB_NAME+"_orderStatisticsStep")
-    @JobScope
-    public Step orderStatisticsStep(@Value("#{jobParameters[date]}") String date,
-                                    @Value("#{jobParameters[path]}") String path) throws Exception {
-        return this.stepBuilderFactory.get(JOB_NAME+"_orderStatisticsStep")
-                .<OrderStatistics, OrderStatistics>chunk(CHUNK)
-                .reader(orderStatisticsItemReader(date))
-                .writer(orderStatisticsItemWriter(date, path))
+    @Bean(JOB_NAME+"_userLevelUpStep.manager")
+    public Step userLevelUpManagerStep() throws Exception {
+        return this.stepBuilderFactory.get(JOB_NAME+"_userLevelUpStep.manager")
+                .partitioner(JOB_NAME+"_userLevelUpStep", new UserLevelUpPartitioner(userRepository))
+                .step(userLevelUpStep())
+                .partitionHandler(taskExecutorPartitionHandler())
                 .build();
     }
 
-    private ItemWriter<? super OrderStatistics> orderStatisticsItemWriter(String date, String path) throws Exception {
+    @Bean(JOB_NAME+"_taskExecutorPartitionHandler")
+    PartitionHandler taskExecutorPartitionHandler() throws Exception {
+        TaskExecutorPartitionHandler handler = new TaskExecutorPartitionHandler();
+
+        handler.setStep(userLevelUpStep());
+        handler.setTaskExecutor(this.taskExecutor);
+        handler.setGridSize(8);
+
+        return handler;
+    }
+
+    @Bean(JOB_NAME+"_splitFlow")
+    @JobScope
+    public Flow splitFlow(@Value("#{jobParameters[date]}") String date) throws Exception {
+        Flow userLevelUpFlow = new FlowBuilder<SimpleFlow>(JOB_NAME+"_userLevelUpFlow")
+                .start(userLevelUpManagerStep())
+                .build();
+
+        // 각 Step을 Flow로 감싼 이유는 2개의 Step의 Flow를 1개의 Flow로 감싸기 위해서.
+        return new FlowBuilder<SimpleFlow>(JOB_NAME+"_splitFlow")
+                .split(this.taskExecutor)
+                .add(userLevelUpFlow, orderStatisticsFlow(date)) // step 병렬로 처리
+                .build();
+    }
+
+
+    private Flow orderStatisticsFlow(String date) throws Exception {
+        return new FlowBuilder<SimpleFlow>(JOB_NAME+"_orderStatisticsFlow")
+                .start(new JobParametersDecide("date"))
+                .on(JobParametersDecide.CONTINUE.getName())
+                .to(this.orderStatisticsStep(date))
+                .build();
+    }
+
+    private Step orderStatisticsStep(@Value("#{jobParameters[date]}") String date) throws Exception {
+        return this.stepBuilderFactory.get(JOB_NAME+"_orderStatisticsStep")
+                .<OrderStatistics, OrderStatistics>chunk(CHUNK)
+                .reader(orderStatisticsItemReader(date))
+                .writer(orderStatisticsItemWriter(date))
+                .build();
+    }
+
+    private ItemWriter<? super OrderStatistics> orderStatisticsItemWriter(String date) throws Exception {
         YearMonth yearMonth = YearMonth.parse(date);
 
         String fileName = yearMonth.getYear() + "년_"+yearMonth.getMonthValue() + "월_일별_주문_금액.csv";
@@ -105,7 +166,7 @@ public class UserConfiguration {
         lineAggregator.setFieldExtractor(fieldExtractor);
 
         FlatFileItemWriter<OrderStatistics> itemWriter = new FlatFileItemWriterBuilder<OrderStatistics>()
-                .resource(new FileSystemResource(path + fileName))
+                .resource(new FileSystemResource("output/" + fileName))
                 .lineAggregator(lineAggregator)
                 .name(JOB_NAME+"_orderStatisticsItemWriter")
                 .encoding("UTF-8")
@@ -169,9 +230,17 @@ public class UserConfiguration {
         };
     }
 
-    private ItemReader<? extends User> itemReader() throws Exception {
+    @Bean(JOB_NAME+"_userItemReader")
+    @StepScope
+    JpaPagingItemReader<? extends User> itemReader(@Value("#{stepExecutionContext[minId]}") Long minId,
+                                          @Value("#{stepExecutionContext[maxId]}") Long maxId) throws Exception {
+        Map<String, Object> parameters = new HashMap<>();
+        parameters.put("minId", minId);
+        parameters.put("maxId", maxId);
+
         JpaPagingItemReader<User> itemReader = new JpaPagingItemReaderBuilder<User>()
-                .queryString("select u from User u")
+                .queryString("select u from User u where u.id between :minId and :maxId")
+                .parameterValues(parameters)
                 .entityManagerFactory(entityManagerFactory)
                 .pageSize(CHUNK)
                 .name(JOB_NAME+"_userItemReader")
